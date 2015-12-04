@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,11 +10,19 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 var borgBinary string
+
+type archive struct {
+	name     string
+	path     string
+	datetime time.Time
+}
 
 func main() {
 	// http server
@@ -21,27 +30,66 @@ func main() {
 	// find repositories
 	// get archives from repository
 	// parse / sort data
-	root, err := getRoot()
+
+	archives, err := getMostRecentArchivesPerRepository()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
+	}
+
+	b, _ := json.Marshal(archives)
+	fmt.Println(string(b))
+
+	// Format into:
+	// [
+	// 	{
+	// 		"repo": "ironhide.tim-online.nl",
+	// 		"date": "2012-04-23T18:25:43.511Z"
+	// 	},
+	// 	{
+	// 		"repo": "starscream.tim-online.nl",
+	// 		"date": "2013-04-23T18:25:43.511Z"
+	// 	},
+	// 	{
+	// 		"repo": "mirage.tim-online.nl",
+	// 		"date": "2013-04-23T18:25:43.511Z"
+	// 	}
+	// ]
+
+}
+
+func getMostRecentArchivesPerRepository() ([]archive, error) {
+	archives := make([]archive, 0)
+
+	root, err := getRoot()
+	if err != nil {
+		return nil, err
 	}
 
 	borgBinary, err = findBorgBinary()
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		return nil, err
 	}
 
-	fmt.Printf("%+v\n", borgBinary)
-
-	repoNames, err := findArchives(root)
+	repoNames, err := findRepositories(root)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("%+v\n", repoNames)
+	for _, repoName := range repoNames {
+		newArchives, err := findArchives(root, repoName)
+
+		if len(newArchives) > 0 {
+			archives = append(archives, newArchives...)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return archives, nil
 }
 
 func getRoot() (string, error) {
@@ -80,39 +128,100 @@ func expandTilde(f string) string {
 	return f
 }
 
-// func findArchives(root string) ([]string, error) {
-// }
-
-func findArchives(root string) ([]string, error) {
-	// Create a nil slice
-	// var repoNames []string
+func findRepositories(root string) ([]string, error) {
 	repoNames := make([]string, 0)
 
-	// Setup command
-	args := []string{"list", root}
-	cmd := exec.Command(borgBinary, args...)
+	files, err := ioutil.ReadDir(root)
+	if err != nil {
+		return repoNames, nil
+	}
 
-	// cmd.Stdout = writeFile
-	// cmd.Stderr = stderr
+	for _, f := range files {
+		repoName := f.Name()
+
+		if !f.IsDir() {
+			continue
+		}
+
+		repoPath := path.Join(root, repoName)
+		if !isRepository(repoPath) {
+			continue
+		}
+
+		repoNames = append(repoNames, f.Name())
+	}
+
+	return repoNames, nil
+}
+
+func findArchives(root string, repoName string) ([]archive, error) {
+	archives := make([]archive, 0)
+
+	// Create path to repo
+	repoPath := path.Join(root, repoName)
+
+	// list archives in repo
+	stdout, _, err := borgList(repoPath)
+	if err != nil {
+		return archives, err
+	}
+
+	// Loop each line in stdout
+	for _, line := range strings.Split(string(stdout), "\n") {
+		// Split line into columns by whitespace
+		fields := strings.Fields(line)
+		// fields := strings.Split(line, "  ")
+
+		// Arbitrary number of fields to act as cutoff
+		if len(fields) < 6 {
+			continue
+		}
+
+		// Collect fields into meaningful columns
+		name := fields[0]
+		str := strings.Join(fields[1:6], " ")
+
+		// Parse date/time column
+		datetime, err := time.Parse("Mon Jan 2 15:04:05 2006", str)
+		if err != nil {
+			return archives, fmt.Errorf("Can't parse %s", str)
+		}
+
+		// Instantiate new archive
+		archive := archive{
+			name:     name,
+			path:     repoPath,
+			datetime: datetime,
+		}
+
+		// Add archive to list
+		archives = append(archives, archive)
+	}
+
+	return archives, nil
+}
+
+func borgList(repoOrArchive string) ([]byte, []byte, error) {
+	// Setup command
+	args := []string{"list", repoOrArchive}
+	cmd := exec.Command(borgBinary, args...)
 
 	// Log stdout
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return repoNames, err
+		return nil, nil, err
 	}
 
 	// Log stderr
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return repoNames, err
+		return nil, nil, err
 	}
-
-	fmt.Println(cmd)
 
 	// Run command
 	err = cmd.Start()
 	if err != nil {
-		return repoNames, err
+		return nil, nil, err
 	}
 
 	// Read stdout & stderr to []byte
@@ -126,17 +235,10 @@ func findArchives(root string) ([]string, error) {
 	err = cmd.Wait()
 	if err != nil {
 		// This gets triggered when exitstatus != 0
-		return repoNames, errors.New(string(line))
+		return nil, nil, errors.New(string(line))
 	}
 
-	// Open /dev/null as io.Writer
-	devNull, _ := os.Open(os.DevNull)
-	defer devNull.Close()
-
-	// Output stdout to /dev/null
-	fmt.Fprintln(devNull, stdout)
-
-	return repoNames, nil
+	return stdout, stderr, nil
 }
 
 func findBorgBinary() (string, error) {
@@ -150,4 +252,18 @@ func lookPath(file string) (string, error) {
 	}
 
 	return exec.LookPath(file)
+}
+
+func isRepository(repoPath string) bool {
+	_, _, err := borgList(repoPath)
+	if err != nil {
+		return false
+	}
+
+	return true
+}
+
+func getRepositoryInfo(repoPath string) (string, error) {
+	// stdout, stderr, err := borgList(repoPath)
+	return "", nil
 }
