@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -14,14 +15,21 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/egonelbre/slice"
 )
 
 var borgBinary string
 
 type archive struct {
-	name     string
-	path     string
-	datetime time.Time
+	Name     string
+	RepoName string
+	Datetime time.Time
+}
+
+type jsonFormat struct {
+	Repo string `json:"repo"`
+	Date string `json:"date"`
 }
 
 func main() {
@@ -31,31 +39,54 @@ func main() {
 	// get archives from repository
 	// parse / sort data
 
+	http.HandleFunc("/recent", recentHandler)
+	http.ListenAndServe(":2674", nil)
+}
+
+// Format into:
+// [
+// 	{
+// 		"repo": "ironhide.tim-online.nl",
+// 		"date": "2012-04-23T18:25:43.511Z"
+// 	},
+// 	{
+// 		"repo": "starscream.tim-online.nl",
+// 		"date": "2013-04-23T18:25:43.511Z"
+// 	},
+// 	{
+// 		"repo": "mirage.tim-online.nl",
+// 		"date": "2013-04-23T18:25:43.511Z"
+// 	}
+// ]
+func recentHandler(w http.ResponseWriter, r *http.Request) {
 	archives, err := getMostRecentArchivesPerRepository()
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	b, _ := json.Marshal(archives)
-	fmt.Println(string(b))
+	// Sort archives by datetime
+	slice.Sort(archives, func(i, j int) bool {
+		return archives[i].Datetime.Before(archives[j].Datetime)
+	})
 
-	// Format into:
-	// [
-	// 	{
-	// 		"repo": "ironhide.tim-online.nl",
-	// 		"date": "2012-04-23T18:25:43.511Z"
-	// 	},
-	// 	{
-	// 		"repo": "starscream.tim-online.nl",
-	// 		"date": "2013-04-23T18:25:43.511Z"
-	// 	},
-	// 	{
-	// 		"repo": "mirage.tim-online.nl",
-	// 		"date": "2013-04-23T18:25:43.511Z"
-	// 	}
-	// ]
+	jsonItems := make([]jsonFormat, 0)
+	for _, archive := range archives {
+		item := jsonFormat{
+			Repo: archive.RepoName,
+			Date: archive.Datetime.Format(time.RFC3339),
+		}
+		jsonItems = append(jsonItems, item)
+	}
 
+	b, err := json.Marshal(jsonItems)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
 }
 
 func getMostRecentArchivesPerRepository() ([]archive, error) {
@@ -79,14 +110,18 @@ func getMostRecentArchivesPerRepository() ([]archive, error) {
 
 	for _, repoName := range repoNames {
 		newArchives, err := findArchives(root, repoName)
-
-		if len(newArchives) > 0 {
-			archives = append(archives, newArchives...)
-		}
-
 		if err != nil {
 			return nil, err
 		}
+
+		if len(newArchives) == 0 {
+			continue
+		}
+
+		// Newest is last
+		n := len(newArchives)
+		archives = append(archives, newArchives[n-1])
+
 	}
 
 	return archives, nil
@@ -144,7 +179,13 @@ func findRepositories(root string) ([]string, error) {
 		}
 
 		repoPath := path.Join(root, repoName)
-		if !isRepository(repoPath) {
+
+		isRepo, err := isRepository(repoPath)
+		if err != nil {
+			return repoNames, err
+		}
+
+		if !isRepo {
 			continue
 		}
 
@@ -182,6 +223,7 @@ func findArchives(root string, repoName string) ([]archive, error) {
 		str := strings.Join(fields[1:6], " ")
 
 		// Parse date/time column
+		// https://golang.org/src/time/format.go#L64
 		datetime, err := time.Parse("Mon Jan 2 15:04:05 2006", str)
 		if err != nil {
 			return archives, fmt.Errorf("Can't parse %s", str)
@@ -189,9 +231,9 @@ func findArchives(root string, repoName string) ([]archive, error) {
 
 		// Instantiate new archive
 		archive := archive{
-			name:     name,
-			path:     repoPath,
-			datetime: datetime,
+			Name:     name,
+			RepoName: repoName,
+			Datetime: datetime,
 		}
 
 		// Add archive to list
@@ -254,13 +296,13 @@ func lookPath(file string) (string, error) {
 	return exec.LookPath(file)
 }
 
-func isRepository(repoPath string) bool {
+func isRepository(repoPath string) (bool, error) {
 	_, _, err := borgList(repoPath)
 	if err != nil {
-		return false
+		return false, err
 	}
 
-	return true
+	return true, nil
 }
 
 func getRepositoryInfo(repoPath string) (string, error) {
