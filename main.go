@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,9 +28,15 @@ type archive struct {
 	Datetime time.Time
 }
 
+type file struct {
+	Path  string
+	Mtime time.Time
+}
+
 type jsonFormat struct {
 	Repo string `json:"repo"`
 	Date string `json:"date"`
+	MysqlDate string `json:"mysql_date"`
 }
 
 func main() {
@@ -39,8 +46,21 @@ func main() {
 	// get archives from repository
 	// parse / sort data
 
+	var err error
+	var port = flag.Int("port", 2674, "specify a port to listen on. Default is 2674")
+	flag.Parse()
+	addr := fmt.Sprintf(":%v", *port)
+
+	borgBinary, err = findBorgBinary()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	http.HandleFunc("/recent", recentHandler)
-	http.ListenAndServe(":2674", nil)
+	err = http.ListenAndServe(addr, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 // Format into:
@@ -48,14 +68,17 @@ func main() {
 // 	{
 // 		"repo": "ironhide.tim-online.nl",
 // 		"date": "2012-04-23T18:25:43.511Z"
+// 		"mysql_date": "2012-04-23T18:25:43.511Z"
 // 	},
 // 	{
 // 		"repo": "starscream.tim-online.nl",
 // 		"date": "2013-04-23T18:25:43.511Z"
+// 		"mysql_date": ""
 // 	},
 // 	{
 // 		"repo": "mirage.tim-online.nl",
 // 		"date": "2013-04-23T18:25:43.511Z"
+// 		"mysql_date": ""
 // 	}
 // ]
 func recentHandler(w http.ResponseWriter, r *http.Request) {
@@ -72,10 +95,28 @@ func recentHandler(w http.ResponseWriter, r *http.Request) {
 
 	jsonItems := make([]jsonFormat, 0)
 	for _, archive := range archives {
-		item := jsonFormat{
-			Repo: archive.RepoName,
-			Date: archive.Datetime.Format(time.RFC3339),
+		mysqlBackup, err := getMostRecentMysqlBackupInArchive(archive)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+
+		// @TODO: this can be done with goroutines to speed it up
+		var item jsonFormat
+		if mysqlBackup == nil {
+			item = jsonFormat{
+				Repo: archive.RepoName,
+				Date: archive.Datetime.Format(time.RFC3339),
+				MysqlDate: "",
+			}
+		} else {
+			item = jsonFormat{
+				Repo: archive.RepoName,
+				Date: archive.Datetime.Format(time.RFC3339),
+				MysqlDate: mysqlBackup.Mtime.Format(time.RFC3339),
+			}
+		}
+
 		jsonItems = append(jsonItems, item)
 	}
 
@@ -94,18 +135,12 @@ func getMostRecentArchivesPerRepository() ([]archive, error) {
 
 	root, err := getRoot()
 	if err != nil {
-		return nil, err
-	}
-
-	borgBinary, err = findBorgBinary()
-	if err != nil {
-		return nil, err
+		return archives, err
 	}
 
 	repoNames, err := findRepositories(root)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		return archives, err
 	}
 
 	for _, repoName := range repoNames {
@@ -128,13 +163,13 @@ func getMostRecentArchivesPerRepository() ([]archive, error) {
 }
 
 func getRoot() (string, error) {
-	flag.Parse()
-
 	if len(os.Args) < 2 {
 		return "", errors.New("You have to provide a root directory")
 	}
 
-	root := os.Args[1]
+	// Use the last argument as root path
+	position := len(os.Args) -1
+	root := os.Args[position]
 
 	// Not necessary, just trying stuff out
 	root = expandTilde(root)
@@ -308,4 +343,123 @@ func isRepository(repoPath string) (bool, error) {
 func getRepositoryInfo(repoPath string) (string, error) {
 	// stdout, stderr, err := borgList(repoPath)
 	return "", nil
+}
+
+func findMysqlBackups(archive archive) ([]file, error) {
+	files := make([]file, 0)
+
+	root, err := getRoot()
+	if err != nil {
+		return files, err
+	}
+
+	repoPath := path.Join(root, archive.RepoName)
+	repoOrArchive := fmt.Sprintf("%v::%v", repoPath, archive.Name)
+
+	stdout, _, err := borgList(repoOrArchive)
+	if err != nil {
+		return files, err
+	}
+
+	globs := []string{
+		"var/backups/mysql/daily/*.sql.gz",
+		"var/backups/mysql/daily/*/ibdata1",
+	}
+
+	// Loop each line in stdout
+	for _, line := range strings.Split(string(stdout), "\n") {
+		// Split line into columns by whitespace
+		fields := strings.Fields(line)
+		// fields := strings.Split(line, "  ")
+
+		// Arbitrary number of fields to act as cutoff
+		if len(fields) < 8 {
+			continue
+		}
+
+		// Collect fields into meaningful columns
+		// permissions := fields[0]
+		// user := fields[1]
+		// group := fields[2]
+		size := fields[3]
+		datetimeStr := strings.Join(fields[4:7], " ")
+		p := fields[7]
+
+		// If no size: don't count it as a match
+		if size == "0" {
+			continue
+		}
+
+		// check if globs match
+		matched := false
+		for _, glob := range globs {
+			matched, err = path.Match(glob, p)
+			if err != nil {
+				return files, err
+			}
+
+			if matched {
+				break
+			}
+		}
+
+		// No globs matched: skip file
+		if matched == false {
+			continue
+		}
+
+		// Parse different date/time columns
+		// okt  9 18:09
+		// apr 11  2014
+		// https://golang.org/src/time/format.go#L64
+		datetime, err := time.Parse("Jan 02 2006", datetimeStr)
+		if err != nil {
+			now := time.Now()
+			year := now.Year()
+			s := fmt.Sprintf("%v %v", datetimeStr, year)
+
+			datetime, err = time.Parse("Jan 02 15:04 2006", s)
+			if err != nil {
+				return files, err
+			}
+
+			// Don't now if truncate is ok
+			if datetime.Truncate(24*time.Hour).After(now) {
+				s := fmt.Sprintf("%v %v", datetimeStr, year-1)
+				datetime, err = time.Parse("Jan 02 15:04 2006", s)
+				if err != nil {
+					return files, err
+				}
+			}
+		}
+
+		// Instantiate new file
+		f := file{
+			Path:  p,
+			Mtime: datetime,
+		}
+
+		// Add archive to list
+		files = append(files, f)
+	}
+
+	return files, nil
+}
+
+func getMostRecentMysqlBackupInArchive(archive archive) (*file, error) {
+	mysqlBackups, err := findMysqlBackups(archive)
+	if err != nil {
+		return nil, nil
+	}
+
+	// Sort mysql backups by datetime (newest first)
+	slice.Sort(mysqlBackups, func(i, j int) bool {
+		return mysqlBackups[i].Mtime.After(mysqlBackups[j].Mtime)
+	})
+
+	if len(mysqlBackups) == 0 {
+		return nil, err
+	}
+
+	return &mysqlBackups[0], err
 }
