@@ -95,6 +95,7 @@ func recentHandler(w http.ResponseWriter, r *http.Request) {
 
 	jsonItems := make([]jsonFormat, 0)
 	for _, archive := range archives {
+		var mysqlBackup *file
 		mysqlBackup, err := getMostRecentMysqlBackupInArchive(archive)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -156,7 +157,6 @@ func getMostRecentArchivesPerRepository() ([]archive, error) {
 		// Newest is last
 		n := len(newArchives)
 		archives = append(archives, newArchives[n-1])
-
 	}
 
 	return archives, nil
@@ -244,22 +244,24 @@ func findArchives(root string, repoName string) ([]archive, error) {
 
 	// Loop each line in stdout
 	for _, line := range strings.Split(string(stdout), "\n") {
-		// Split line into columns by whitespace
+		// Split line into columns by whitespace:
 		fields := strings.Fields(line)
-		// fields := strings.Split(line, "  ")
+
+		// 0.27.0: wbb.tim-online.nl-2015-10-31  Mon Jan 2 15:04:05 2006
+		// 0.30.0: wbb.tim-online.nl-2016-01-27  Wed, 2016-01-27 03:01:19
 
 		// Arbitrary number of fields to act as cutoff
-		if len(fields) < 6 {
+		if len(fields) < 4 {
 			continue
 		}
 
 		// Collect fields into meaningful columns
 		name := fields[0]
-		str := strings.Join(fields[1:6], " ")
+		str := strings.Join(fields[1:4], " ")
 
 		// Parse date/time column
 		// https://golang.org/src/time/format.go#L64
-		datetime, err := time.Parse("Mon Jan 2 15:04:05 2006", str)
+		datetime, err := time.Parse("Mon, 2006-01-02 15:04:05", str)
 		if err != nil {
 			return archives, fmt.Errorf("Can't parse %s", str)
 		}
@@ -362,7 +364,9 @@ func findMysqlBackups(archive archive) ([]file, error) {
 	}
 
 	globs := []string{
+		// sql dumps
 		"var/backups/mysql/daily/*.sql.gz",
+		// binary backups
 		"var/backups/mysql/daily/*/ibdata1",
 	}
 
@@ -412,25 +416,9 @@ func findMysqlBackups(archive archive) ([]file, error) {
 		// okt  9 18:09
 		// apr 11  2014
 		// https://golang.org/src/time/format.go#L64
-		datetime, err := time.Parse("Jan 02 2006", datetimeStr)
+		datetime, err := time.Parse("Mon, 2006-01-02 15:04:05", datetimeStr)
 		if err != nil {
-			now := time.Now()
-			year := now.Year()
-			s := fmt.Sprintf("%v %v", datetimeStr, year)
-
-			datetime, err = time.Parse("Jan 02 15:04 2006", s)
-			if err != nil {
-				return files, err
-			}
-
-			// Don't now if truncate is ok
-			if datetime.Truncate(24*time.Hour).After(now) {
-				s := fmt.Sprintf("%v %v", datetimeStr, year-1)
-				datetime, err = time.Parse("Jan 02 15:04 2006", s)
-				if err != nil {
-					return files, err
-				}
-			}
+			return files, fmt.Errorf("Can't parse %s", datetimeStr)
 		}
 
 		// Instantiate new file
